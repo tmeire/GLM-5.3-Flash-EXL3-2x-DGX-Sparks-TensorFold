@@ -1,0 +1,145 @@
+# Programmatic dependent launch for the decode expert kernels (TF_GLM_PDL, on by default): rot_in, the decode
+# trellis kernel and its two fused epilogues launch with programmatic stream serialization, so their blocks are
+# scheduled and set up while the previous kernel of the stream still runs; each kernel calls
+# cudaGridDependencySynchronize() before its first load, so the bits are the same as the plain launch, only the
+# launch latency hides (the same idea as DeepInfer's set_pdl(True), here on the EXL3 decode chain). SM90 and later
+# take the device sync; older archs and TF_GLM_PDL=0 keep the plain launch. Launch sites in exl3.cu only (the
+# prompt grouped kernel and the other kernels' launches are untouched); CUDA graphs capture the attribute.
+diff --git tensorfold/families/glm5_next/cuda/estimators.py tensorfold/families/glm5_next/cuda/estimators.py
+new file mode 100644
+index 0000000..e69de29
+diff --git tensorfold/families/glm5_next/cuda/exl3.cu tensorfold/families/glm5_next/cuda/exl3.cu
+index c14c1b3..8a9ad94 100644
+--- tensorfold/families/glm5_next/cuda/exl3.cu
++++ tensorfold/families/glm5_next/cuda/exl3.cu
+@@ -11,12 +11,45 @@
+ 
+ #include <cuda_fp16.h>
+ #include <cuda_bf16.h>
++#include <cstdlib>
+ #include <ATen/ATen.h>
+ #include <ATen/cuda/CUDAContext.h>
+ #include <c10/cuda/CUDAGuard.h>
+ 
+ namespace {
+ 
++// TF_GLM_PDL (default on; TF_GLM_PDL=0 off): launches with programmatic stream serialization, so a kernel's blocks
++// are scheduled and set up while the previous kernel of the stream still runs, and the hardware chains the two
++// grids (PDL). Launch order only, the same bits either way, like the launch-order template parameter below; no
++// kernel's math changes. Each launched kernel calls cudaGridDependencySynchronize() before its first load, which
++// compiles for SM90 and later and is a no-op without the launch attribute (or before SM90).
++inline bool pdl_on() {
++    static const bool on = [] {
++        const char* v = getenv("TF_GLM_PDL");
++        return !(v && v[0] == '0' && v[1] == '\0');
++    }();
++    return on;
++}
++
++template <typename K, typename... A>
++inline void launch_pdl(K kernel, dim3 grid, dim3 block, cudaStream_t stream, A... args) {
++    if (pdl_on()) {
++        cudaLaunchConfig_t cfg{};
++        cfg.gridDim = grid;
++        cfg.blockDim = block;
++        cfg.dynamicSmemBytes = 0;
++        cfg.stream = stream;
++        cudaLaunchAttribute attr[1];
++        attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
++        attr[0].val.programmaticStreamSerializationAllowed = 1;
++        cfg.attrs = attr;
++        cfg.numAttrs = 1;
++        cudaLaunchKernelEx(&cfg, kernel, args...);
++        return;
++    }
++    kernel<<<grid, block, 0, stream>>>(args...);
++}
++
+ constexpr float HAD_SCALE = 0.08838834764831845f;   // 1 / sqrt(128)
+ 
+ // Two values of the "mcg" codebook from two 16-bit states, as a half2 (first state in .x).
+@@ -239,6 +272,9 @@ template <bool ROWS>
+ __global__ void rot_in_kernel(const __nv_bfloat16* __restrict__ x, int x_stride, const int* __restrict__ pick,
+                               const half* __restrict__ suh0, const half* __restrict__ suh1, half* __restrict__ out0,
+                               half* __restrict__ out1, int K, int slots) {
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
++    cudaGridDependencySynchronize();                     // PDL (TF_GLM_PDL): the previous kernel's writes are visible
++#endif
+     const int p = blockIdx.x, blk = blockIdx.y, mat = blockIdx.z;
+     int row, e;
+     if (ROWS) {
+@@ -271,6 +307,9 @@ __global__ void gateup_epilogue_kernel(const float* __restrict__ Z, const int* _
+                                        const half* __restrict__ svh_g, const half* __restrict__ svh_u,
+                                        const half* __restrict__ suh_d, half* __restrict__ xd, int P, int N, int SK,
+                                        int slots, float limit) {
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
++    cudaGridDependencySynchronize();                     // PDL (TF_GLM_PDL): the previous kernel's writes are visible
++#endif
+     const int p = blockIdx.x, blk = blockIdx.y;
+     const int row = p / slots, slot = p % slots;
+     if (slot == slots - 1) return;
+@@ -309,6 +348,9 @@ __global__ void gateup_epilogue_kernel(const float* __restrict__ Z, const int* _
+ __global__ void down_epilogue_kernel(const float* __restrict__ Z, const int* __restrict__ pick,
+                                      const half* __restrict__ svh_d, float* __restrict__ y, int P, int D, int SK,
+                                      int slots) {
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
++    cudaGridDependencySynchronize();                     // PDL (TF_GLM_PDL): the previous kernel's writes are visible
++#endif
+     const int p = blockIdx.x, blk = blockIdx.y;
+     const int row = p / slots, slot = p % slots;
+     if (slot == slots - 1) return;
+@@ -354,6 +396,9 @@ __global__ void __launch_bounds__(W * 32) dec_kernel(
+     const int* __restrict__ members, float* __restrict__ Z, int K, int N, int P, int SK, int E, int slots,
+     const half* __restrict__ sv0, const half* __restrict__ sv1, const half* __restrict__ su2, void* __restrict__ out,
+     float limit, int* __restrict__ done) {
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
++    cudaGridDependencySynchronize();                     // PDL (TF_GLM_PDL): the previous kernel's writes are visible
++#endif
+     static_assert(FUSE == 0 || NT * 16 == 128, "a fused epilogue needs one 128-column Hadamard block a program");
+     static_assert(LD == 0 || (NT % 4 == 0 && PD >= 1 && STEPS % PD == 0), "LD 1: NT a multiple of 4, PD | STEPS");
+     int item = blockIdx.x, nblock = blockIdx.y, zz = blockIdx.z;
+@@ -958,7 +1003,7 @@ void exl3_rot_in_cuda(const at::Tensor& x, int64_t x_stride, const at::Tensor& p
+                       const at::Tensor& suh1, at::Tensor& out0, at::Tensor& out1, int64_t rows, int64_t K,
+                       int64_t slots) {
+     dim3 grid((unsigned)(rows * slots), (unsigned)(K / 128), 2);
+-    rot_in_kernel<false><<<grid, 32, 0, at::cuda::getCurrentCUDAStream()>>>(
++    launch_pdl(rot_in_kernel<false>, grid, dim3(32), at::cuda::getCurrentCUDAStream(),
+         reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), (int)x_stride, pick.data_ptr<int>(),
+         reinterpret_cast<const half*>(suh0.data_ptr()), reinterpret_cast<const half*>(suh1.data_ptr()),
+         reinterpret_cast<half*>(out0.data_ptr()), reinterpret_cast<half*>(out1.data_ptr()), (int)K, (int)slots);
+@@ -971,7 +1016,7 @@ void exl3_rot_rows_cuda(const at::Tensor& x, int64_t x_stride, const at::Tensor&
+     dim3 grid((unsigned)rows, (unsigned)(K / 128), 1);
+     auto s = reinterpret_cast<const half*>(suh.data_ptr());
+     auto o = reinterpret_cast<half*>(out.data_ptr());
+-    rot_in_kernel<true><<<grid, 32, 0, at::cuda::getCurrentCUDAStream()>>>(
++    launch_pdl(rot_in_kernel<true>, grid, dim3(32), at::cuda::getCurrentCUDAStream(),
+         reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), (int)x_stride, nullptr, s, s, o, o, (int)K, 1);
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
+@@ -980,7 +1025,7 @@ void exl3_gateup_epilogue_cuda(const at::Tensor& Z, const at::Tensor& pick, cons
+                                const at::Tensor& svh_u, const at::Tensor& suh_d, at::Tensor& xd, int64_t rows,
+                                int64_t P, int64_t N, int64_t SK, int64_t slots, double limit) {
+     dim3 grid((unsigned)(rows * slots), (unsigned)(N / 128));
+-    gateup_epilogue_kernel<<<grid, 32, 0, at::cuda::getCurrentCUDAStream()>>>(
++    launch_pdl(gateup_epilogue_kernel, grid, dim3(32), at::cuda::getCurrentCUDAStream(),
+         Z.data_ptr<float>(), pick.data_ptr<int>(), reinterpret_cast<const half*>(svh_g.data_ptr()),
+         reinterpret_cast<const half*>(svh_u.data_ptr()), reinterpret_cast<const half*>(suh_d.data_ptr()),
+         reinterpret_cast<half*>(xd.data_ptr()), (int)P, (int)N, (int)SK, (int)slots, (float)limit);
+@@ -990,7 +1035,7 @@ void exl3_gateup_epilogue_cuda(const at::Tensor& Z, const at::Tensor& pick, cons
+ void exl3_down_epilogue_cuda(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor& svh_d, at::Tensor& y,
+                              int64_t rows, int64_t P, int64_t D, int64_t SK, int64_t slots) {
+     dim3 grid((unsigned)(rows * slots), (unsigned)(D / 128));
+-    down_epilogue_kernel<<<grid, 32, 0, at::cuda::getCurrentCUDAStream()>>>(
++    launch_pdl(down_epilogue_kernel, grid, dim3(32), at::cuda::getCurrentCUDAStream(),
+         Z.data_ptr<float>(), pick.data_ptr<int>(), reinterpret_cast<const half*>(svh_d.data_ptr()),
+         y.data_ptr<float>(), (int)P, (int)D, (int)SK, (int)slots);
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+@@ -1014,7 +1059,7 @@ static void dec_launch(const at::Tensor& X0, const at::Tensor& X1, const at::Ten
+     auto h = [](const at::Tensor& t) { return reinterpret_cast<const half*>(t.data_ptr()); };
+     auto w = [](const at::Tensor& t) { return reinterpret_cast<const uint32_t*>(t.data_ptr()); };
+ #define DEC1S(F_, XR_, LD_, PD_, SW_)                                                                             \
+-    dec_kernel<NT, W, STEPS, F_, XR_, LD_, PD_, SW_><<<grid, W * 32, 0, stream>>>(                                \
++    launch_pdl(dec_kernel<NT, W, STEPS, F_, XR_, LD_, PD_, SW_>, grid, dim3(W * 32), stream,                      \
+         h(X0), h(X1), w(T0), w(T1), items.data_ptr<int>(), counts.data_ptr<int>(), members.data_ptr<int>(),       \
+         Z.data_ptr<float>(), (int)K, (int)N, (int)P, (int)SK, (int)E, (int)slots, h(sv0), h(sv1), h(su2),         \
+         out.data_ptr(), (float)limit, done.data_ptr<int>())

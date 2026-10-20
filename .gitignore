@@ -1,0 +1,7 @@
+# Reference checkouts used for analysis (their own repos, not part of this one)
+/DeepInfer/
+/TensorFold/
+
+# This setup's own values (see scripts/local.sh.example)
+scripts/local.sh
+.env

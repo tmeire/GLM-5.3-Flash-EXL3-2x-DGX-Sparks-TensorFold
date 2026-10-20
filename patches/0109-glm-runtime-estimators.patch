@@ -1,0 +1,154 @@
+# Decode-round timing tables (TF_GLM_EST, on by default): how many milliseconds a verify forward over R rows takes
+# on the GPU (a CUDA event pair, read after the round's sampler has synchronized it anyway) and how long the
+# sampler's host side takes, sliding medians per verify-row count, from DeepInfer's ForwardRuntimeEstimator /
+# SamplerRuntimeEstimator pattern (its MTPVarlen confidence-scheduled verification reads exactly these two tables).
+# Read-only observation on both ranks: nothing branches on it yet, so the ranks stay in step; a verify-budget
+# search will be the first reader. New tensorfold/families/glm5_next/cuda/estimators.py, hooks in the multi-stream
+# round, /health's "est" and /metrics's tensorfold_health:est_* gauges.
+diff --git tensorfold/families/glm5_next/cuda/estimators.py tensorfold/families/glm5_next/cuda/estimators.py
+new file mode 100644
+index 0000000..20d502f
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/estimators.py
+@@ -0,0 +1,66 @@
++"""Decode-round timing tables, by verify-row count (TF_GLM_EST, on by default; TF_GLM_EST=0 off).
++
++DeepInfer's confidence-scheduled verification (its MTPVarlen scheduler, csrc/engine/mtp_varlen.hpp) picks each
++round's verify budget from a profiled decode performance curve (milliseconds a verify forward over R rows takes)
++plus a sliding-median sampler cost, choosing the budget that maximizes tokens a millisecond. This records the same
++two tables on this setup: a round's verify GPU time from a CUDA event pair, and the sampler's host side, both per
++total verify rows. The event pair is read after the round's sampler has synchronized the forward anyway, so no
++extra sync is added (RoundProfile reads its own pair the same way). Read-only observation on both ranks: nothing
++branches on it yet, so the two ranks stay exactly in step; a verify-budget search will be the first reader. The
++medians go to /health ("est") and /metrics."""
++
++from __future__ import annotations
++
++import os
++import statistics
++import time
++
++import torch
++
++ENABLED = os.environ.get("TF_GLM_EST", "1") != "0"
++WINDOW = 9                       # samples kept per row count (DeepInfer's sliding median)
++MIN_SAMPLES = 3                  # samples before a row count's median is reported
++
++
++class _Rows:
++    """Milliseconds by verify-row count, a sliding median per count."""
++
++    def __init__(self) -> None:
++        self.samples: dict[int, list[float]] = {}
++
++    def observe(self, rows: int, ms: float) -> None:
++        bucket = self.samples.setdefault(int(rows), [])
++        bucket.append(float(ms))
++        del bucket[:-WINDOW]
++
++    def medians(self) -> dict[int, float]:
++        return {rows: round(statistics.median(values), 3) for rows, values in sorted(self.samples.items())
++                if len(values) >= MIN_SAMPLES}
++
++
++class Estimators:
++    """The two tables, plus the CUDA event pair a round's verify GPU time is read from."""
++
++    def __init__(self) -> None:
++        self.cuda = torch.cuda.is_available()
++        self.ev = [torch.cuda.Event(enable_timing=True) for _ in range(2)] if self.cuda else None
++        self.verify = _Rows()
++        self.sample = _Rows()
++        self.rounds = 0
++
++    def gpu_begin(self) -> None:
++        if self.ev is not None:
++            self.ev[0].record()
++
++    def gpu_end(self) -> None:
++        if self.ev is not None:
++            self.ev[1].record()
++
++    def observe(self, rows: int, sample_s: float) -> None:
++        self.rounds += 1
++        if self.ev is not None:
++            self.verify.observe(rows, self.ev[0].elapsed_time(self.ev[1]))
++        self.sample.observe(rows, sample_s * 1e3)
++
++    def info(self) -> dict:
++        return {"rounds": self.rounds, "verify_ms": self.verify.medians(), "sample_ms": self.sample.medians()}
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index 06f33e7..7fa31bf 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -50,7 +50,7 @@ from tensorfold.cuda.scheduler import Scheduler
+ from tensorfold.server.errors import CapacityError  # TFCAP-0075
+ from tensorfold.cuda.streams import Stream, next_fill
+ 
+-from . import multi_prefill, sliced_fill
++from . import estimators, multi_prefill, sliced_fill
+ from .multi_tune import MultiSettings, RoundProfile, allocate, reach_of, sample_packed, scaled_confidence
+ from .pool import ALIGN, Pool, align_up
+ from .verify import BatchedVerify, Segment, SerialVerify, Verified
+@@ -542,6 +542,8 @@ class MultiDecoder:
+             self.profiles = {False: RoundProfile(self.tune.profile, label="batched"),
+                              True: RoundProfile(self.tune.profile, label="lone stream, one-stream graphs")}
+         self.profile = None                              # the current round's (``profiles``), or None
++        # TF_GLM_EST (default on): the decode-round timing tables by verify rows (estimators.py), /health's "est"
++        self.est = estimators.Estimators() if estimators.ENABLED and torch.cuda.is_available() else None
+         self.solo_verify = SerialVerify(e, taps=self.drafts is not None)
+         graphs = getattr(e, "graphs", None)
+         self.lone_rows = max((r for r, _ in getattr(graphs, "main", {})), default=0)
+@@ -608,6 +610,7 @@ class MultiDecoder:
+                 },
+                 **({"multi_prefill": dict(self.grouped)} if self.group else {}),
+                 **({"spill": self.disk.info()} if self.disk is not None else {}),
++                **({"est": self.est.info()} if getattr(self, "est", None) is not None else {}),
+                 # how long rank 0's current iteration has run (0 between iterations): a stalled server keeps growing it
+                 "iteration_s": round(time.monotonic() - since, 1)
+                 if (since := getattr(self, "iteration_since", None)) is not None else 0.0}
+@@ -2099,9 +2102,14 @@ class MultiDecoder:
+                 raise RuntimeError(f"rank {self.rank}: a lone round's stream is not at the graphs' home")
+             if len(segments[0].tokens) <= self.lone_rows:
+                 verify = self.solo_verify
++        est = self.est
++        if est is not None:
++            est.gpu_begin()
+         if prof is not None:
+             prof.gpu_start()
+         v = forward_streams(verify, segments)
++        if est is not None:
++            est.gpu_end()
+         if prof is not None:
+             prof.gpu_stop()
+             prof.mark("verify")
+@@ -2112,7 +2120,10 @@ class MultiDecoder:
+             parts.append((logits, [l.st.pos + 1 + r for r in range(len(seg.tokens))], l.s.sampling))
+         # A short round has one row per stream: pack nucleus gathers too, avoiding
+         # repeated rank exchanges between prompt slices with the same exact draws.
++        t_sample = time.perf_counter() if est is not None else 0.0
+         sampled = sample_packed(self.w, parts) if short or tune.sampler == "packed" else sample_streams(self.w, parts)
++        if est is not None:                   # the sampler's gathers synced the verify forward: read its GPU time
++            est.observe(sum(len(seg.tokens) for seg in segments), time.perf_counter() - t_sample)
+         if prof is not None:
+             prof.mark("sample")
+         keeps = []
+diff --git tensorfold/server/metrics.py tensorfold/server/metrics.py
+index c96a9a8..b474e16 100644
+--- tensorfold/server/metrics.py
++++ tensorfold/server/metrics.py
+@@ -236,6 +236,14 @@ def _health(lines: list[str], app: Any) -> None:
+             else:
+                 name, kind = f"spill_{key}_total", "counter"
+             _family(lines, name, kind, f"Spill tier: /health's spill.{key}.", [f"{HEALTH}{name} {_num(value)}"], HEALTH)
++    est = body.get("est")
++    if isinstance(est, dict):                     # the decode-round timing tables (TF_GLM_EST): medians by verify rows
++        for kind, what in (("verify_ms", "Verify forward GPU"), ("sample_ms", "Sampler host")):
++            rows_ms = est.get(kind)
++            if isinstance(rows_ms, dict):
++                _family(lines, f"est_{kind}", "gauge", f"{what} milliseconds a decode round takes, by verify rows.",
++                        [f'{HEALTH}est_{kind}{{rows="{rows}"}} {_num(ms)}' for rows, ms in sorted(rows_ms.items())
++                         if isinstance(ms, (int, float))], HEALTH)
+ 
+ 
+ def _read(read, default):
