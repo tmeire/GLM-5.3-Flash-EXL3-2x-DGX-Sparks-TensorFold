@@ -5,9 +5,6 @@
 # launch latency hides (the same idea as DeepInfer's set_pdl(True), here on the EXL3 decode chain). SM90 and later
 # take the device sync; older archs and TF_GLM_PDL=0 keep the plain launch. Launch sites in exl3.cu only (the
 # prompt grouped kernel and the other kernels' launches are untouched); CUDA graphs capture the attribute.
-diff --git tensorfold/families/glm5_next/cuda/estimators.py tensorfold/families/glm5_next/cuda/estimators.py
-new file mode 100644
-index 0000000..e69de29
 diff --git tensorfold/families/glm5_next/cuda/exl3.cu tensorfold/families/glm5_next/cuda/exl3.cu
 index c14c1b3..8a9ad94 100644
 --- tensorfold/families/glm5_next/cuda/exl3.cu
